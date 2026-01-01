@@ -1,0 +1,5 @@
+{
+  "name": "AutoShorts AI",
+  "description": "Fully automated YouTube Shorts creator and uploader using Gemini AI and Browser APIs.",
+  "requestFramePermissions": []
+}

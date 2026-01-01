@@ -1,0 +1,211 @@
+import express from 'express';
+import { google } from 'googleapis';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import multer from 'multer';
+import cookieSession from 'cookie-session';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+// Fix __dirname for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Ensure uploads directory exists
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)){
+    fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+// Middleware
+app.use(cors({ 
+    origin: FRONTEND_URL, 
+    credentials: true 
+}));
+app.use(express.json());
+app.use(
+  cookieSession({
+    name: 'session',
+    keys: [process.env.SESSION_SECRET || 'autoshorts_secret_key'],
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    secure: false, // Set to true if using HTTPS in production
+    sameSite: 'lax', // Required for OAuth redirect flow
+    httpOnly: true
+  })
+);
+
+// File Upload Handling
+const upload = multer({ dest: uploadDir });
+
+// OAuth2 Client Setup
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
+
+/**
+ * 1. Auth URL Endpoint
+ * Generates the Google Login URL and redirects the user.
+ */
+app.get('/api/youtube/auth', (req, res) => {
+  const scopes = [
+    'https://www.googleapis.com/auth/youtube.upload',
+    'https://www.googleapis.com/auth/youtube.readonly'
+  ];
+
+  const url = oauth2Client.generateAuthUrl({
+    access_type: 'offline', // Essential for refresh tokens
+    scope: scopes,
+    include_granted_scopes: true,
+    prompt: 'consent' // Forces refresh token generation
+  });
+
+  res.redirect(url);
+});
+
+/**
+ * 2. OAuth Callback
+ * Handles the redirect from Google, exchanges code for tokens.
+ */
+app.get('/api/youtube/callback', async (req, res) => {
+  const { code } = req.query;
+
+  if (!code) {
+    return res.redirect(`${FRONTEND_URL}?error=access_denied`);
+  }
+
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    // Store tokens securely in HTTP-only session cookie
+    req.session.tokens = tokens;
+
+    res.redirect(`${FRONTEND_URL}?status=connected`);
+  } catch (error) {
+    console.error('OAuth Error:', error);
+    res.redirect(`${FRONTEND_URL}?error=oauth_failed`);
+  }
+});
+
+/**
+ * 3. Check Status / Get User Profile
+ * Verifies if the user has a valid session and returns channel info.
+ */
+app.get('/api/user', async (req, res) => {
+  if (!req.session || !req.session.tokens) {
+    return res.status(401).json({ authenticated: false });
+  }
+
+  try {
+    oauth2Client.setCredentials(req.session.tokens);
+    
+    // Check if token needs refreshing
+    const now = Date.now();
+    if (req.session.tokens.expiry_date && req.session.tokens.expiry_date < now) {
+        console.log("Refreshing token...");
+        const { credentials } = await oauth2Client.refreshAccessToken();
+        req.session.tokens = { ...req.session.tokens, ...credentials };
+        oauth2Client.setCredentials(credentials);
+    }
+
+    const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+    const response = await youtube.channels.list({
+      part: 'snippet',
+      mine: true
+    });
+
+    if (response.data.items && response.data.items.length > 0) {
+      const channel = response.data.items[0];
+      res.json({
+        authenticated: true,
+        name: channel.snippet.title,
+        picture: channel.snippet.thumbnails.default.url,
+        channelId: channel.id
+      });
+    } else {
+      res.status(404).json({ authenticated: false, message: 'No channel found' });
+    }
+  } catch (error) {
+    console.error('User Fetch Error:', error);
+    // Clear session on error (likely revoked)
+    req.session = null;
+    res.status(401).json({ authenticated: false, error: error.message });
+  }
+});
+
+/**
+ * 4. Upload Endpoint
+ * Receives video file from frontend and uploads to YouTube.
+ */
+app.post('/api/upload', upload.single('video'), async (req, res) => {
+  if (!req.session || !req.session.tokens) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  if (!req.file) {
+    return res.status(400).json({ error: 'No video file uploaded' });
+  }
+
+  try {
+    oauth2Client.setCredentials(req.session.tokens);
+    const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+
+    const { title, description, tags } = req.body;
+    const tagList = tags ? JSON.parse(tags) : [];
+
+    const resYoutube = await youtube.videos.insert({
+      part: 'snippet,status',
+      requestBody: {
+        snippet: {
+          title: title || 'AutoShorts AI Video',
+          description: description || 'Generated by AutoShorts AI',
+          tags: tagList,
+          categoryId: '22', // People & Blogs
+        },
+        status: {
+          privacyStatus: 'public', // Change to 'private' for testing
+          selfDeclaredMadeForKids: false,
+        },
+      },
+      media: {
+        body: fs.createReadStream(req.file.path),
+      },
+    });
+
+    // Cleanup uploaded file from server
+    if (fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+    }
+
+    res.json({ success: true, videoId: resYoutube.data.id, videoUrl: `https://youtu.be/${resYoutube.data.id}` });
+
+  } catch (error) {
+    console.error('Upload Error:', error);
+    // Cleanup on error
+    if (req.file && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+    }
+    res.status(500).json({ error: 'Upload failed', details: error.message });
+  }
+});
+
+/**
+ * 5. Logout
+ */
+app.post('/api/logout', (req, res) => {
+  req.session = null;
+  res.json({ success: true });
+});
+
+app.listen(PORT, () => {
+  console.log(`Backend running on http://localhost:${PORT}`);
+});
